@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Financial Statement Extractor</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+        }
+
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin-top: 20px;
+        }
+
+        th, td {
+            border: 1px solid #ccc;
+            padding: 6px;
+            text-align: center;
+        }
+
+        th {
+            background: #e3f2fd;
+        }
+
+        .btn {
+            padding: 10px 16px;
+            background: #1976d2;
+            color: white;
+            border: none;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+
+        .btn:hover {
+            background: #1565c0;
+        }
+
+        #downloadBtn {
+            display: none;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+
+<body>
+
+<h2>📊 Financial Statement Extractor</h2>
+
+<input type="file" id="fileInput">
+<button class="btn" onclick="upload()">Upload & Process</button>
+
+<p id="status"></p>
+
+<div id="tableContainer"></div>
+
+<button id="downloadBtn" class="btn">Download Excel</button>
+
+
+<script>
+
+async function upload() {
+
+    const file = document.getElementById("fileInput").files[0];
+
+    if (!file) {
+        alert("Please select a PDF file");
+        return;
+    }
+
+    const form = new FormData();
+    form.append("file", file);
+
+    document.getElementById("status").innerText = "⏳ Processing...";
+
+    const res = await fetch("/upload", {
+        method: "POST",
+        body: form
+    });
+
+    const data = await res.json();
+
+    if (data.status !== "success") {
+        document.getElementById("status").innerText = "❌ Failed";
+        return;
+    }
+
+    document.getElementById("status").innerText = "✅ Done";
+
+    renderTable(data);
+
+    const btn = document.getElementById("downloadBtn");
+
+    btn.style.display = "block";
+    btn.onclick = () => {
+        window.location.href = data.download;
+    };
+}
+
+
+function renderTable(data) {
+
+    const years = data.years;
+    const rows = data.rows;
+
+    let html = "<table>";
+
+    // Header
+    html += "<tr><th>Particulars</th>";
+
+    for (let y of years) {
+        html += `<th>${y}</th>`;
+    }
+
+    html += "</tr>";
+
+
+    // Rows
+    for (let r of rows) {
+
+        html += `<tr><td><b>${r.name}</b></td>`;
+
+        for (let y of years) {
+
+            let val = r.values[y] || "MISSING";
+
+            html += `<td>${val}</td>`;
+        }
+
+        html += "</tr>";
+    }
+
+    html += "</table>";
+
+    document.getElementById("tableContainer").innerHTML = html;
+}
+
+</script>
+
+</body>
+</html>

@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+openpyxl
+pandas
+pytesseract
+Pillow
+groq
+camelot-py[cv]
+opencv-python
+ghostscript
+python-multipart
