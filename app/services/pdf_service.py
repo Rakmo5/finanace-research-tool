@@ -1,148 +1,66 @@
-import fitz  # PyMuPDF
+import fitz
 import pytesseract
 from PIL import Image
-import tempfile
-import os
-import cv2
-import numpy as np
+import io
 
 from app.core.logger import logger
 
 
-# ---- HARD SET TESSERACT PATH ----
+# Windows path (change if needed)
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
-# ---------------- Check if PDF has real text ----------------
+def extract_text(path):
 
-def is_text_pdf(path: str) -> bool:
-    try:
-        doc = fitz.open(path)
-
-        for page in doc:
-            text = page.get_text().strip()
-            if len(text) > 100:
-                return True
-
-        return False
-
-    except Exception as e:
-        logger.warning(f"PDF text check failed: {e}")
-        return False
-
-
-# ---------------- Native Text Extraction ----------------
-
-def extract_text_native(path):
-
-    logger.info("Using native PDF text extraction")
-
-    chunks = []
+    logger.info("Starting Hybrid PDF extraction")
 
     doc = fitz.open(path)
+
+    chunks = []   # ✅ store page-wise text
+
+    # ---------- Try Native Text ----------
+    for page in doc:
+
+        t = page.get_text("text")
+
+        if t and len(t.strip()) > 50:
+            chunks.append(t.strip())
+
+
+    # If native worked → return
+    if len(chunks) >= len(doc) // 2:
+
+        logger.info("Using native extraction")
+
+        doc.close()
+        return chunks
+
+
+    # ---------- OCR Fallback ----------
+    logger.warning("Native extraction failed. Using OCR...")
+
+
+    chunks = []  # reset
 
     for i, page in enumerate(doc):
 
-        text = page.get_text()
+        pix = page.get_pixmap(dpi=300)
 
-        if text and len(text.strip()) > 50:
-            chunks.append(text)
-            logger.info(f"Extracted native text from page {i+1}")
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
 
-    return chunks
+        ocr_text = pytesseract.image_to_string(
+            img,
+            lang="eng",
+            config="--psm 6"
+        )
 
+        if ocr_text and len(ocr_text.strip()) > 50:
+            chunks.append(ocr_text.strip())
 
-# ---------------- OCR Extraction ----------------
+        logger.info(f"OCR processed page {i+1}")
 
-def extract_text_ocr(path):
+    doc.close()
 
-    logger.info("Using OCR extraction")
-
-    chunks = []
-
-    doc = fitz.open(path)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-
-        for i, page in enumerate(doc):
-
-            # Render page to high-quality image
-            pix = page.get_pixmap(dpi=400)
-
-            img_path = os.path.join(tmpdir, f"page_{i}.png")
-            pix.save(img_path)
-
-            # Load image
-            img = cv2.imread(img_path)
-
-            if img is None:
-                continue
-
-            # Convert to grayscale
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-            # Improve contrast
-            gray = cv2.equalizeHist(gray)
-
-            # Remove noise
-            gray = cv2.medianBlur(gray, 3)
-
-            # Adaptive threshold for table clarity
-            thresh = cv2.adaptiveThreshold(
-                gray,
-                255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY,
-                31,
-                2
-            )
-
-            processed = Image.fromarray(thresh)
-
-            custom_config = r"""
-            --oem 3
-            --psm 6
-            -c preserve_interword_spaces=1
-            """
-
-            text = pytesseract.image_to_string(
-                processed,
-                lang="eng",
-                config=custom_config
-            )
-
-            if text and len(text.strip()) > 50:
-                chunks.append(text)
-                logger.info(f"OCR extracted text from page {i+1}")
-
-    return chunks
-
-
-# ---------------- Hybrid Extractor ----------------
-
-def extract_text(path):
-
-    logger.info("Starting hybrid PDF extraction")
-
-    # Case 1: Text PDF
-    if is_text_pdf(path):
-
-        logger.info("Detected text-based PDF")
-
-        chunks = extract_text_native(path)
-
-        if chunks:
-            return chunks
-
-        logger.warning("Native extraction empty. Falling back to OCR...")
-
-    # Case 2: Scanned PDF
-    logger.info("Using OCR fallback")
-
-    chunks = extract_text_ocr(path)
-
-    if not chunks:
-        logger.error("OCR failed to extract text")
-        return []
+    logger.info("OCR extraction complete")
 
     return chunks

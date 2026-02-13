@@ -8,10 +8,10 @@ from app.core.config import UPLOAD_DIR, OUTPUT_DIR
 from app.core.logger import logger
 
 from app.services.pdf_service import extract_text
+from app.services.table_service import extract_tables
 from app.services.llm_service import parse_with_llm
 from app.services.validator import validate_data
 from app.services.excel_service import export_excel
-from app.services.rule_extractor import extract_core_rows
 
 
 router = APIRouter()
@@ -20,12 +20,96 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+# ---------------- CONFIG ----------------
+
+CURRENT_YEAR = datetime.datetime.now().year
+
+
+IMPORTANT_ROWS = [
+    "revenue",
+    "income",
+    "expense",
+    "profit",
+    "tax",
+    "loss",
+    "earning",
+    "eps",
+    "depreciation",
+    "finance",
+    "interest",
+    "cost",
+    "margin",
+    "comprehensive"
+]
+
+
+# ---------------- HELPERS ----------------
+def is_valid_year(y: str) -> bool:
+
+    y = y.upper().strip()
+
+    # Year
+    if re.match(r"^20\d{2}$", y):
+        return True
+
+    # Financial year
+    if re.match(r"^20\d{2}-\d{2}$", y):
+        return True
+
+    # Quarter
+    if re.match(r"^Q[1-4]$", y):
+        return True
+
+    # Month period
+    if re.match(r"^\d+M$", y):
+        return True
+
+    # Date
+    if re.match(r"^\d{2}/\d{2}/20\d{2}$", y):
+        return True
+
+    return False
+def is_useful_row(name: str) -> bool:
+
+    if not name:
+        return False
+
+    n = name.lower().strip()
+
+    # Too short → junk
+    if len(n) < 4:
+        return False
+
+    # Must contain at least one finance keyword
+    KEYWORDS = [
+        "revenue", "income", "expense", "profit", "loss", "tax",
+        "margin", "cost", "depreciation", "amortisation",
+        "ebitda", "interest", "segment", "asset", "debt",
+        "equity", "dividend", "cash", "liability", "turnover"
+    ]
+
+    if not any(k in n for k in KEYWORDS):
+        return False
+
+    # Junk patterns
+    JUNK = [
+        "gate", "sofa", "pna", "sss", "atom", "reofsiutian"
+    ]
+
+    if any(j in n for j in JUNK):
+        return False
+
+    return True
+
+# ---------------- API ----------------
+
 @router.post("/upload")
 async def upload(file: UploadFile = File(...)):
 
     logger.info("Upload started")
 
     file_id = str(uuid.uuid4())
+
     pdf_path = f"{UPLOAD_DIR}/{file_id}.pdf"
 
     logger.info(f"Saving file: {file.filename}")
@@ -36,39 +120,61 @@ async def upload(file: UploadFile = File(...)):
     logger.info("File saved")
 
 
-    # -------- Extract Text --------
+    # ---------- Try Table Extraction ----------
 
-    chunks = extract_text(pdf_path)
+    tables = extract_tables(pdf_path)
 
-    if not chunks:
+    text = ""
+
+
+    if tables:
+
+        logger.info("Using Camelot extracted tables")
+
+        for df in tables:
+
+            text += df.to_csv(index=False)
+            text += "\n\n"
+
+
+    # ---------- OCR / Native Fallback ----------
+
+    else:
+
+        logger.info("No tables found. Using OCR/Text extraction")
+
+        chunks = extract_text(pdf_path)
+
+        if chunks:
+            text = "\n\n".join(chunks)
+
+
+    if not text.strip():
+
+        logger.error("No usable text extracted")
 
         return {
             "status": "error",
-            "message": "No text extracted"
+            "message": "Could not extract content from PDF"
         }
 
 
-    full_text = "\n\n".join(chunks)
-
-    logger.info(f"Text length: {len(full_text)}")
+    logger.info(f"Total extracted text length: {len(text)}")
 
 
-    # -------- Chunk for LLM --------
+    # ---------- Chunk for LLM ----------
 
     MAX_CHUNK = 3500
 
-    llm_chunks = [
-        full_text[i:i+MAX_CHUNK]
-        for i in range(0, len(full_text), MAX_CHUNK)
+    chunks = [
+        text[i:i + MAX_CHUNK]
+        for i in range(0, len(text), MAX_CHUNK)
     ]
 
-
-    # -------- Rule Extract --------
-
-    rule_data = extract_core_rows(full_text)
+    logger.info(f"Split into {len(chunks)} LLM chunks")
 
 
-    # -------- Aggregation --------
+    # ---------- Aggregate Results ----------
 
     row_map = {}
     all_years = set()
@@ -77,14 +183,12 @@ async def upload(file: UploadFile = File(...)):
     unit = "UNKNOWN"
 
 
-    # -------- LLM Pass --------
-
-    for i, chunk in enumerate(llm_chunks):
+    for i, chunk in enumerate(chunks):
 
         if len(chunk.strip()) < 200:
             continue
 
-        logger.info(f"LLM chunk {i+1}/{len(llm_chunks)}")
+        logger.info(f"Processing LLM chunk {i+1}/{len(chunks)}")
 
         result = parse_with_llm(chunk)
 
@@ -92,25 +196,34 @@ async def upload(file: UploadFile = File(...)):
             continue
 
 
+        # -------- Metadata --------
+
         currency = result.get("currency", currency)
         unit = result.get("unit", unit)
 
 
-        # Years
+        # -------- Years --------
+
         for y in result.get("years", []):
 
             y = str(y).strip()
 
-            if re.search(r"\d{4}", y):
+            if is_valid_year(y):
                 all_years.add(y)
 
 
-        # Rows
+        # -------- Rows --------
+
         for r in result.get("rows", []):
 
             name = r.get("name", "").strip()
 
             if not name:
+                continue
+
+
+            # Remove junk OCR rows
+            if not is_useful_row(name):
                 continue
 
 
@@ -127,33 +240,49 @@ async def upload(file: UploadFile = File(...)):
 
             for year, val in r.get("values", {}).items():
 
-                row_map[key]["values"][str(year)] = val
+                year = str(year).strip()
+
+                if is_valid_year(year):
+
+                    row_map[key]["values"][year] = val
+
+# ---------- Limit to Last 7 Periods ----------
+
+def sort_key(y):
+    # Put real years first
+    if y.isdigit():
+        return int(y)
+
+    # Handle dates like 31/12/2025
+    if "/" in y:
+        parts = y.split("/")
+        return int(parts[-1])
+
+    return 0
 
 
-    # -------- Merge Rule Rows --------
+# Sort years properly
+sorted_years = sorted(list(all_years), key=sort_key)
 
-    for cname, values in rule_data.items():
+# Keep only last 7
+if len(sorted_years) > 7:
+    sorted_years = sorted_years[-7:]
 
-        key = cname.lower()
+logger.info(f"Using final years: {sorted_years}")
 
-        if key not in row_map:
+# Remove other years from rows
+for row in row_map.values():
 
-            row_map[key] = {
-                "name": cname,
-                "values": {}
-            }
+    filtered = {}
 
+    for y in sorted_years:
+        filtered[y] = row["values"].get(y, "MISSING")
 
-        for i, y in enumerate(sorted(all_years)):
+    row["values"] = filtered
 
-            if i < len(values):
+all_years = set(sorted_years)
 
-                if y not in row_map[key]["values"]:
-
-                    row_map[key]["values"][y] = values[i]
-
-
-    # -------- Final Object --------
+    # ---------- Final Object ----------
 
     raw = {
         "currency": currency,
@@ -163,12 +292,16 @@ async def upload(file: UploadFile = File(...)):
     }
 
 
+    logger.info("Validating extracted data")
+
     data = validate_data(raw)
 
 
-    # -------- Export --------
+    # ---------- Export Excel ----------
 
-    export_excel(data, file_id)
+    excel_path = export_excel(data, file_id)
+
+    logger.info("Excel generated successfully")
 
 
     return {
