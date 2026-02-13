@@ -1,53 +1,64 @@
 import camelot
-import pandas as pd
+import fitz
 
 from app.core.logger import logger
 
 
+# ---------------- Quick Text Check ----------------
+
+def has_text_first_pages(path, max_pages=2):
+
+    doc = fitz.open(path)
+
+    pages = min(len(doc), max_pages)
+
+    for i in range(pages):
+
+        txt = doc[i].get_text().strip()
+
+        if len(txt) > 100:
+            return True
+
+    return False
+
+
+# ---------------- Table Extractor ----------------
+
 def extract_tables(pdf_path):
 
-    logger.info("Starting Camelot table extraction")
+    # Quick reject: no text → skip Camelot
+    if not has_text_first_pages(pdf_path):
 
-    tables = []
+        logger.info("PDF likely scanned. Skipping Camelot.")
 
-    try:
-        # Try lattice first (best for bordered tables)
-        t1 = camelot.read_pdf(pdf_path, pages="all", flavor="lattice")
+        return []
 
-        if t1 and len(t1) > 0:
-            logger.info(f"Lattice extracted {len(t1)} tables")
-            tables.extend(t1)
 
-    except Exception as e:
-        logger.warning(f"Lattice failed: {e}")
-
+    logger.info("Trying Camelot table extraction")
 
     try:
-        # Fallback to stream (for borderless tables)
-        t2 = camelot.read_pdf(pdf_path, pages="all", flavor="stream")
 
-        if t2 and len(t2) > 0:
-            logger.info(f"Stream extracted {len(t2)} tables")
-            tables.extend(t2)
+        # Only try first 3 pages
+        tables = camelot.read_pdf(
+            pdf_path,
+            pages="1-3",
+            flavor="stream"
+        )
+
+        if tables.n == 0:
+
+            logger.info("Camelot found no tables")
+
+            return []
+
+
+        logger.info(f"Camelot found {tables.n} tables")
+
+        return [t.df for t in tables]
+
 
     except Exception as e:
-        logger.warning(f"Stream failed: {e}")
 
+        logger.warning(f"Camelot failed: {e}")
 
-    if not tables:
-        logger.warning("No tables found via Camelot")
-
-
-    # Convert to DataFrames
-    dfs = []
-
-    for i, table in enumerate(tables):
-
-        df = table.df
-
-        if len(df) > 2 and len(df.columns) > 2:
-            dfs.append(df)
-            logger.info(f"Accepted table {i+1}")
-
-
-    return dfs
+        return []

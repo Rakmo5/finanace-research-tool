@@ -1,15 +1,17 @@
 from fastapi import APIRouter, UploadFile, File
 import uuid
 import os
+import re
+import datetime
 
 from app.core.config import UPLOAD_DIR, OUTPUT_DIR
 from app.core.logger import logger
 
 from app.services.pdf_service import extract_text
-from app.services.table_service import extract_tables
 from app.services.llm_service import parse_with_llm
 from app.services.validator import validate_data
 from app.services.excel_service import export_excel
+from app.services.rule_extractor import extract_core_rows
 
 
 router = APIRouter()
@@ -34,59 +36,39 @@ async def upload(file: UploadFile = File(...)):
     logger.info("File saved")
 
 
-    # ---------- Try Table Extraction First ----------
+    # -------- Extract Text --------
 
-    tables = extract_tables(pdf_path)
+    chunks = extract_text(pdf_path)
 
-    text = ""
-
-
-    if tables:
-
-        logger.info("Using Camelot extracted tables")
-
-        for df in tables:
-            text += df.to_csv(index=False)
-            text += "\n\n"
-
-
-    # ---------- Fallback to OCR/Text ----------
-
-    else:
-
-        logger.info("No tables found. Using OCR extraction")
-
-        chunks = extract_text(pdf_path)
-
-        text = "\n\n".join(chunks)
-
-
-    if not text.strip():
-
-        logger.error("No usable text extracted")
+    if not chunks:
 
         return {
             "status": "error",
-            "message": "Could not extract content from PDF"
+            "message": "No text extracted"
         }
 
 
-    logger.info(f"Total extracted text length: {len(text)}")
+    full_text = "\n\n".join(chunks)
+
+    logger.info(f"Text length: {len(full_text)}")
 
 
-    # ---------- Chunk Large Text for LLM ----------
+    # -------- Chunk for LLM --------
 
     MAX_CHUNK = 3500
 
-    chunks = [
-        text[i:i+MAX_CHUNK]
-        for i in range(0, len(text), MAX_CHUNK)
+    llm_chunks = [
+        full_text[i:i+MAX_CHUNK]
+        for i in range(0, len(full_text), MAX_CHUNK)
     ]
 
-    logger.info(f"Split into {len(chunks)} LLM chunks")
+
+    # -------- Rule Extract --------
+
+    rule_data = extract_core_rows(full_text)
 
 
-    # ---------- Aggregate Results ----------
+    # -------- Aggregation --------
 
     row_map = {}
     all_years = set()
@@ -95,12 +77,14 @@ async def upload(file: UploadFile = File(...)):
     unit = "UNKNOWN"
 
 
-    for i, chunk in enumerate(chunks):
+    # -------- LLM Pass --------
+
+    for i, chunk in enumerate(llm_chunks):
 
         if len(chunk.strip()) < 200:
             continue
 
-        logger.info(f"Processing LLM chunk {i+1}/{len(chunks)}")
+        logger.info(f"LLM chunk {i+1}/{len(llm_chunks)}")
 
         result = parse_with_llm(chunk)
 
@@ -108,17 +92,20 @@ async def upload(file: UploadFile = File(...)):
             continue
 
 
-        # Metadata
         currency = result.get("currency", currency)
         unit = result.get("unit", unit)
 
 
         # Years
         for y in result.get("years", []):
-            all_years.add(str(y))
+
+            y = str(y).strip()
+
+            if re.search(r"\d{4}", y):
+                all_years.add(y)
 
 
-        # Merge rows
+        # Rows
         for r in result.get("rows", []):
 
             name = r.get("name", "").strip()
@@ -126,19 +113,47 @@ async def upload(file: UploadFile = File(...)):
             if not name:
                 continue
 
+
             key = name.lower()
 
+
             if key not in row_map:
+
                 row_map[key] = {
                     "name": name,
                     "values": {}
                 }
 
+
             for year, val in r.get("values", {}).items():
+
                 row_map[key]["values"][str(year)] = val
 
 
-    # ---------- Final Object ----------
+    # -------- Merge Rule Rows --------
+
+    for cname, values in rule_data.items():
+
+        key = cname.lower()
+
+        if key not in row_map:
+
+            row_map[key] = {
+                "name": cname,
+                "values": {}
+            }
+
+
+        for i, y in enumerate(sorted(all_years)):
+
+            if i < len(values):
+
+                if y not in row_map[key]["values"]:
+
+                    row_map[key]["values"][y] = values[i]
+
+
+    # -------- Final Object --------
 
     raw = {
         "currency": currency,
@@ -148,16 +163,12 @@ async def upload(file: UploadFile = File(...)):
     }
 
 
-    logger.info("Validating extracted data")
-
     data = validate_data(raw)
 
 
-    # ---------- Export Excel ----------
+    # -------- Export --------
 
-    excel_path = export_excel(data, file_id)
-
-    logger.info("Excel generated successfully")
+    export_excel(data, file_id)
 
 
     return {
@@ -169,4 +180,3 @@ async def upload(file: UploadFile = File(...)):
         "rows": data.rows,
         "download": f"/outputs/{file_id}.xlsx"
     }
-
