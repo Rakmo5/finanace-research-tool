@@ -1,62 +1,209 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Financial Statement Extractor</title>
+<meta charset="UTF-8">
+<title>Financial Statement Extractor</title>
 
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 40px;
-        }
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 
-        table {
-            border-collapse: collapse;
-            width: 100%;
-            margin-top: 20px;
-        }
+<style>
 
-        th, td {
-            border: 1px solid #ccc;
-            padding: 6px;
-            text-align: center;
-        }
+* {
+    box-sizing: border-box;
+    font-family: "Inter", sans-serif;
+}
 
-        th {
-            background: #e3f2fd;
-        }
+body {
+    background: linear-gradient(135deg, #e3f2fd, #f5f9ff);
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
 
-        .btn {
-            padding: 10px 16px;
-            background: #1976d2;
-            color: white;
-            border: none;
-            cursor: pointer;
-            border-radius: 4px;
-        }
+/* Main Card */
 
-        .btn:hover {
-            background: #1565c0;
-        }
+.container {
+    background: white;
+    width: 95%;
+    max-width: 1100px;
+    padding: 30px;
+    border-radius: 14px;
+    box-shadow: 0 15px 40px rgba(0,0,0,0.12);
+}
 
-        #downloadBtn {
-            display: none;
-            margin-top: 20px;
-        }
-    </style>
+
+/* Header */
+
+.header {
+    text-align: center;
+    margin-bottom: 25px;
+}
+
+.header h1 {
+    margin: 0;
+    color: #1565c0;
+    font-size: 28px;
+}
+
+.header p {
+    color: #555;
+    margin-top: 6px;
+}
+
+
+/* Upload Section */
+
+.upload-box {
+    background: #f1f7ff;
+    border: 2px dashed #90caf9;
+    padding: 25px;
+    border-radius: 12px;
+    text-align: center;
+    margin-bottom: 20px;
+}
+
+.upload-box input {
+    margin-bottom: 15px;
+}
+
+.btn {
+    background: linear-gradient(135deg, #1976d2, #0d47a1);
+    color: white;
+    border: none;
+    padding: 10px 22px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    transition: 0.2s;
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 15px rgba(25,118,210,0.3);
+}
+
+
+/* Status */
+
+#status {
+    text-align: center;
+    margin: 15px 0;
+    font-weight: 600;
+}
+
+
+/* Table */
+
+.table-wrapper {
+    max-height: 450px;
+    overflow: auto;
+    border-radius: 10px;
+    border: 1px solid #ddd;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+    background: white;
+}
+
+th, td {
+    padding: 10px;
+    text-align: center;
+    border-bottom: 1px solid #eee;
+    font-size: 14px;
+}
+
+th {
+    background: #e3f2fd;
+    color: #0d47a1;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+}
+
+td:first-child {
+    font-weight: 600;
+    text-align: left;
+    background: #fafafa;
+}
+
+tr:hover {
+    background: #f9fcff;
+}
+
+
+/* Download Button */
+
+#downloadBtn {
+    display: none;
+    margin: 25px auto 0;
+    display: block;
+}
+
+
+/* Loader */
+
+.loader {
+    width: 28px;
+    height: 28px;
+    border: 4px solid #ddd;
+    border-top: 4px solid #1976d2;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin: 10px auto;
+    display: none;
+}
+
+@keyframes spin {
+    100% { transform: rotate(360deg); }
+}
+
+</style>
 </head>
 
 <body>
 
-<h2>📊 Financial Statement Extractor</h2>
 
-<input type="file" id="fileInput">
-<button class="btn" onclick="upload()">Upload & Process</button>
+<div class="container">
 
-<p id="status"></p>
+    <!-- Header -->
+    <div class="header">
+        <h1>📊 Financial Statement Extractor</h1>
+        <p>Upload PDF → Extract → Download Excel</p>
+    </div>
 
-<div id="tableContainer"></div>
 
-<button id="downloadBtn" class="btn">Download Excel</button>
+    <!-- Upload Box -->
+    <div class="upload-box">
+
+        <input type="file" id="fileInput" accept="application/pdf">
+
+        <br>
+
+        <button class="btn" onclick="upload()">Process PDF</button>
+
+        <div class="loader" id="loader"></div>
+
+        <p id="status"></p>
+
+    </div>
+
+
+    <!-- Table -->
+    <div id="tableContainer"></div>
+
+
+    <!-- Download -->
+    <button id="downloadBtn" class="btn">
+        ⬇ Download Excel
+    </button>
+
+</div>
+
 
 
 <script>
@@ -73,31 +220,57 @@ async function upload() {
     const form = new FormData();
     form.append("file", file);
 
-    document.getElementById("status").innerText = "⏳ Processing...";
 
-    const res = await fetch("/upload", {
-        method: "POST",
-        body: form
-    });
+    // UI
+    document.getElementById("status").innerText = "Processing...";
+    document.getElementById("loader").style.display = "block";
+    document.getElementById("downloadBtn").style.display = "none";
+    document.getElementById("tableContainer").innerHTML = "";
 
-    const data = await res.json();
 
-    if (data.status !== "success") {
-        document.getElementById("status").innerText = "❌ Failed";
-        return;
+    try {
+
+        const res = await fetch("/upload", {
+            method: "POST",
+            body: form
+        });
+
+        const data = await res.json();
+
+        document.getElementById("loader").style.display = "none";
+
+
+        if (data.status !== "success") {
+
+            document.getElementById("status").innerText = "❌ Failed to process";
+            return;
+        }
+
+        document.getElementById("status").innerText = "✅ Extraction Complete";
+
+        renderTable(data);
+
+
+        const btn = document.getElementById("downloadBtn");
+
+        btn.style.display = "block";
+
+        btn.onclick = () => {
+            window.location.href = data.download;
+        };
+
     }
 
-    document.getElementById("status").innerText = "✅ Done";
+    catch (err) {
 
-    renderTable(data);
+        console.error(err);
 
-    const btn = document.getElementById("downloadBtn");
+        document.getElementById("loader").style.display = "none";
 
-    btn.style.display = "block";
-    btn.onclick = () => {
-        window.location.href = data.download;
-    };
+        document.getElementById("status").innerText = "❌ Server Error";
+    }
 }
+
 
 
 function renderTable(data) {
@@ -105,7 +278,9 @@ function renderTable(data) {
     const years = data.years;
     const rows = data.rows;
 
-    let html = "<table>";
+
+    let html = `<div class="table-wrapper"><table>`;
+
 
     // Header
     html += "<tr><th>Particulars</th>";
@@ -120,7 +295,7 @@ function renderTable(data) {
     // Rows
     for (let r of rows) {
 
-        html += `<tr><td><b>${r.name}</b></td>`;
+        html += `<tr><td>${r.name}</td>`;
 
         for (let y of years) {
 
@@ -132,7 +307,9 @@ function renderTable(data) {
         html += "</tr>";
     }
 
-    html += "</table>";
+
+    html += "</table></div>";
+
 
     document.getElementById("tableContainer").innerHTML = html;
 }

@@ -1,173 +1,109 @@
-from groq import Groq
-import json
-import re
+# app/services/llm_service.py (replace parse_with_llm / filter / prompt parts)
 
+import json, re
+from groq import Groq
 from app.core.config import GROQ_KEY, MAX_TEXT_LENGTH
 from app.core.logger import logger
 
-
 client = Groq(api_key=GROQ_KEY)
 
-
-# ---------------- CLEANER ----------------
-
-def detect_periods(text):
-
-    years = re.findall(r"(20\d{2})", text)
-
-    dates = re.findall(r"\d{2}/\d{2}/\d{4}", text)
-
-    periods = list(set(years + dates))
-
-    return periods[:8]  # limit to avoid noise
-
+KEEP_KEYWORDS = [
+    "revenue","income","profit","loss","tax","expense","cost","ebitda","depreciation",
+    "interest","finance","employee","salary","wages","eps","earning","dividend"
+]
 
 def filter_financial_lines(text):
-
-    lines = text.split("\n")
-
-    keep = []
-
-    keywords = [
-        "revenue", "income", "expense", "profit", "tax",
-        "ebitda", "total", "cost", "depreciation",
-        "amortisation", "finance", "asset", "liability",
-        "equity", "inventory", "cash", "debt"
-    ]
-
-    for line in lines:
-
-        l = line.lower().strip()
-
-        if len(l) < 5:
+    """
+    Keep lines that 1) contain a finance keyword OR 2) have >=4 digits
+    Also collapse multi-spaces and strip page headers/footers heuristics.
+    """
+    lines = []
+    for raw in text.splitlines():
+        l = raw.strip()
+        if not l:
             continue
+        # remove likely footers/headers (page numbers)
+        if re.match(r"^(page|pg|www|\d{1,3})\b", l.lower()):
+            continue
+        # keep if numeric heavy
+        digits = sum(c.isdigit() for c in l)
+        if digits >= 4:
+            lines.append(" ".join(l.split()))
+            continue
+        # keep if contains finance keyword and at least one digit
+        low = l.lower()
+        if any(k in low for k in KEEP_KEYWORDS) and any(c.isdigit() for c in l):
+            lines.append(" ".join(l.split()))
+            continue
+    return "\n".join(lines)
 
-        # Keep financial keyword rows
-        if any(k in l for k in keywords):
-            keep.append(line)
-
-        # Keep numeric-heavy rows
-        elif sum(c.isdigit() for c in line) >= 6:
-            keep.append(line)
-
-    # Normalize spaces
-    cleaned = []
-
-    for l in keep:
-        l = " ".join(l.split())
-        cleaned.append(l)
-
-    return "\n".join(cleaned)
-
-
-# ---------------- JSON Extractor ----------------
 
 def extract_json(text):
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    return m.group() if m else None
 
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-
-    if match:
-        return match.group()
-
-    return None
-
-
-# ---------------- LLM Parser ----------------
 
 def parse_with_llm(text, retry=True):
-
-    logger.info("Cleaning chunk before sending to LLM")
-
-    cleaned_text = filter_financial_lines(text)
-    periods = detect_periods(text)
-    if not cleaned_text.strip():
+    logger.info("Preparing chunk for LLM")
+    cleaned = filter_financial_lines(text)
+    if not cleaned.strip():
         logger.warning("Chunk empty after cleaning")
         return None
 
-
-    logger.info("Sending cleaned chunk to Groq LLM")
+    # try to detect years heuristically
+    periods = list(dict.fromkeys(re.findall(r"(20\d{2}|Q[1-4]|\d+M|\d{2}/\d{2}/20\d{2})", text)))
 
     prompt = f"""
-You are a financial analyst.
-
-Extract income statement data from this document chunk.
-
-Detected periods: {periods}
-Use these as columns when possible.
-
-Return ONLY valid JSON.
-NO explanation.
-NO markdown.
-
+You are a conservative financial analytics assistant. Extract an income-statement-like table from the text.
+Return STRICT JSON only (no explanation). If uncertain, use "MISSING".
 Schema:
 {{
  "currency":"",
  "unit":"",
  "years":[],
- "rows":[
-   {{
-    "name":"",
-    "values":{{}}
-   }}
- ]
+ "rows":[{{"name":"","values":{{}},"source_sample":""}}]
 }}
 
-Rules:
-- Do NOT invent numbers
-- Extract ONLY from given text
-- Use "MISSING" if not present
-- Years must be strings
-- Values must be strings
+Rules (be strict):
+- Do NOT invent numbers. Only return numbers/strings exactly present in the provided text.
+- Years must be strings.
+- Values must be strings.
+- If a value cannot be located exactly, use "MISSING".
+- Limit rows to income-statement lines (revenue, other income, cogs, expenses, finance costs, depreciation, pbt, tax, pat, eps).
+- Use the provided 'DetectedPeriods' list if helpful.
 
-Text:
-{cleaned_text[:MAX_TEXT_LENGTH]}
+DetectedPeriods: {periods}
+
+TEXT:
+{cleaned[:MAX_TEXT_LENGTH]}
 """
 
     res = client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[
-            {"role": "system", "content": "You output strict financial JSON only."},
-            {"role": "user", "content": prompt}
+            {"role":"system","content":"You must output valid JSON only."},
+            {"role":"user","content":prompt}
         ],
         temperature=0
     )
 
     content = res.choices[0].message.content.strip()
+    logger.info("LLM raw output preview: " + content[:400])
 
-    logger.info("Raw LLM output (first 300 chars):")
-    logger.info(content[:300])
-
-
-    # Try direct parse
+    # try parse
     try:
         return json.loads(content)
-
     except Exception:
-
-        logger.warning("Direct JSON parse failed. Trying extraction...")
-
+        logger.warning("LLM JSON parse failed, extracting braces")
         extracted = extract_json(content)
-
         if extracted:
             try:
                 return json.loads(extracted)
             except Exception:
-                pass
-
-
-    # Retry once
+                logger.error("Extraction parse failed")
+    # retry once
     if retry:
-
-        logger.warning("Retrying this chunk once...")
-
+        logger.warning("Retrying LLM once (more conservative)")
         return parse_with_llm(text, retry=False)
 
-
-    logger.error("LLM failed on this chunk")
-
-    return {
-        "currency": "UNKNOWN",
-        "unit": "UNKNOWN",
-        "years": [],
-        "rows": []
-    }
+    return {"currency":"UNKNOWN","unit":"UNKNOWN","years":[],"rows":[]}

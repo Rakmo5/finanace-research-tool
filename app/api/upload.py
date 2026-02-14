@@ -19,65 +19,49 @@ router = APIRouter()
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+
 CURRENT_YEAR = datetime.datetime.now().year
 
 
-# ---------------- YEAR NORMALIZER ----------------
+# ---------------- HELPERS ----------------
 
-def normalize_year(y: str):
+def is_valid_year(y: str) -> bool:
 
     y = y.strip()
 
+    if y.isdigit():
+        return 2000 <= int(y) <= CURRENT_YEAR
+
     if "/" in y:
-        parts = y.split("/")
-        if len(parts) == 3:
-            y = parts[-1]
+        try:
+            return int(y.split("/")[-1]) <= CURRENT_YEAR
+        except:
+            return False
 
-    if re.match(r"^20\d{2}-\d{2}$", y):
-        base = int(y[:4])
-        y = str(base + 1)
-
-    if re.match(r"^Q[1-4]\s*20\d{2}$", y.upper()):
-        y = y[-4:]
-
-    if re.match(r"^20\d{2}$", y):
-
-        iy = int(y)
-
-        if 2010 <= iy <= CURRENT_YEAR + 1:
-            return y
-
-    return None
+    return False
 
 
-# ---------------- ROW FILTER ----------------
+def remove_empty_rows(rows, years):
 
-def is_useful_row(name: str):
+    clean = []
 
-    if not name:
-        return False
+    for r in rows:
 
-    n = name.lower().strip()
+        if any(r["values"].get(y) != "MISSING" for y in years):
+            clean.append(r)
 
-    if len(n) < 4:
-        return False
+    return clean
 
-    KEYWORDS = [
-        "revenue", "income", "expense", "profit", "loss", "tax",
-        "margin", "cost", "depreciation", "amortisation",
-        "ebitda", "interest", "segment", "asset", "debt",
-        "equity", "dividend", "cash", "turnover"
-    ]
 
-    if not any(k in n for k in KEYWORDS):
-        return False
+def sort_key(y):
 
-    JUNK = ["gate", "sofa", "pna", "sss", "atom", "reofsiutian"]
+    if y.isdigit():
+        return int(y)
 
-    if any(j in n for j in JUNK):
-        return False
+    if "/" in y:
+        return int(y.split("/")[-1])
 
-    return True
+    return 0
 
 
 # ---------------- API ----------------
@@ -126,7 +110,7 @@ async def upload(file: UploadFile = File(...)):
 
         return {
             "status": "error",
-            "message": "No content extracted"
+            "message": "No readable content"
         }
 
 
@@ -154,7 +138,8 @@ async def upload(file: UploadFile = File(...)):
         if len(chunk.strip()) < 200:
             continue
 
-        logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+
+        logger.info(f"LLM chunk {i+1}/{len(chunks)}")
 
         result = parse_with_llm(chunk)
 
@@ -169,10 +154,10 @@ async def upload(file: UploadFile = File(...)):
         # Years
         for y in result.get("years", []):
 
-            ny = normalize_year(str(y))
+            y = str(y).strip()
 
-            if ny:
-                all_years.add(ny)
+            if is_valid_year(y):
+                all_years.add(y)
 
 
         # Rows
@@ -180,7 +165,7 @@ async def upload(file: UploadFile = File(...)):
 
             name = r.get("name", "").strip()
 
-            if not is_useful_row(name):
+            if not name:
                 continue
 
 
@@ -195,17 +180,17 @@ async def upload(file: UploadFile = File(...)):
                 }
 
 
-            for y, v in r.get("values", {}).items():
+            for year, val in r.get("values", {}).items():
 
-                ny = normalize_year(str(y))
+                year = str(year).strip()
 
-                if ny:
-                    row_map[key]["values"][ny] = v
+                if is_valid_year(year):
+                    row_map[key]["values"][year] = val
 
 
-    # ---------- Limit to Last 7 Years ----------
+    # ---------- Keep Last 7 Years ----------
 
-    sorted_years = sorted(all_years)
+    sorted_years = sorted(list(all_years), key=sort_key)
 
     if len(sorted_years) > 7:
         sorted_years = sorted_years[-7:]
@@ -213,6 +198,8 @@ async def upload(file: UploadFile = File(...)):
 
     logger.info(f"Final years: {sorted_years}")
 
+
+    # ---------- Filter Row Values ----------
 
     for row in row_map.values():
 
@@ -224,33 +211,28 @@ async def upload(file: UploadFile = File(...)):
         row["values"] = filtered
 
 
-    all_years = set(sorted_years)
-
-
     # ---------- Remove Empty Rows ----------
 
-    clean_rows = {}
-
-    for k, row in row_map.items():
-
-        if any(v != "MISSING" for v in row["values"].values()):
-            clean_rows[k] = row
+    rows = remove_empty_rows(
+        list(row_map.values()),
+        sorted_years
+    )
 
 
-    row_map = clean_rows
-
-
-    # ---------- Final ----------
+    # ---------- Final Object ----------
 
     raw = {
         "currency": currency,
         "unit": unit,
-        "years": sorted(list(all_years)),
-        "rows": list(row_map.values())
+        "years": sorted_years,
+        "rows": rows
     }
 
 
     data = validate_data(raw)
+
+
+    # ---------- Excel ----------
 
     excel_path = export_excel(data, file_id)
 
