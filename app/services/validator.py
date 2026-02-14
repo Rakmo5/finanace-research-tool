@@ -1,67 +1,89 @@
-# app/services/validator.py
-
-import datetime, re
+import re
 from app.models.schema import FinancialData
 from app.core.logger import logger
 
-def is_future_year(y):
-    y = str(y).strip()
-    # 2026 or 31/12/2026 etc.
-    m = re.search(r"(20\d{2})", y)
-    if m:
-        year = int(m.group(1))
-        return year > datetime.datetime.now().year
-    return False
 
-def post_process(raw, max_periods=7):
-    # convert years to strings and drop future years
-    years = [str(y) for y in raw.get("years", []) if not is_future_year(y)]
-    # dedupe/preserve order
-    years = list(dict.fromkeys(years))
+def clean_value(val):
 
-    # keep only last max_periods (by numeric year when possible)
-    def key_fn(y):
-        if y.isdigit():
-            return int(y)
-        if "/" in y:
-            return int(y.split("/")[-1])
-        if y.upper().startswith("Q"):
-            # treat as current-year quarters (lowest priority)
-            return datetime.datetime.now().year
-        return 0
+    if val is None:
+        return "MISSING"
 
-    years_sorted = sorted(years, key=key_fn)
-    if len(years_sorted) > max_periods:
-        years_sorted = years_sorted[-max_periods:]
 
-    # rebuild rows: keep only rows with at least one non-MISSING value
-    processed_rows = []
-    for r in raw.get("rows", []):
-        vals = {str(k): str(v) for k, v in r.get("values", {}).items() if str(k) in years_sorted}
-        # count non-missing
-        non_missing = sum(1 for v in vals.values() if v and v != "MISSING")
-        if non_missing == 0:
-            continue
-        processed_rows.append({
-            "name": r.get("name"),
-            "values": {y: vals.get(y, "MISSING") for y in years_sorted}
-        })
+    v = str(val).strip()
 
-    return {
-        "currency": raw.get("currency", "UNKNOWN"),
-        "unit": raw.get("unit", "UNKNOWN"),
-        "years": years_sorted,
-        "rows": processed_rows
-    }
+
+    # Remove commas
+    v = v.replace(",", "")
+
+
+    # Handle brackets ( (1234) => -1234 )
+    if v.startswith("(") and v.endswith(")"):
+        v = "-" + v[1:-1]
+
+
+    # Remove currency
+    v = re.sub(r"[₹$€]", "", v)
+
+
+    # Remove junk chars
+    v = re.sub(r"[A-Za-z]", "", v)
+
+
+    # Normalize dash
+    if v in ["-", "—", "–", ""]:
+        return "MISSING"
+
+
+    # Valid number
+    if re.match(r"^-?\d+(\.\d+)?$", v):
+        return v
+
+
+    return "MISSING"
+
+
+
+def normalize(raw):
+
+    raw["years"] = [str(y) for y in raw.get("years", [])]
+
+
+    for row in raw.get("rows", []):
+
+        new_vals = {}
+
+
+        for k, v in row.get("values", {}).items():
+
+            new_vals[str(k)] = clean_value(v)
+
+
+        row["values"] = new_vals
+
+
+    return raw
+
+
 
 def validate_data(raw):
-    logger.info("Post-processing LLM output")
-    cleaned = post_process(raw, max_periods=7)
-    # Use pydantic schema to ensure shape
-    data = FinancialData(**cleaned)
-    # ensure each row has years keys
+
+    logger.info("Normalizing extracted data")
+
+    raw = normalize(raw)
+
+
+    logger.info("Validating schema")
+
+    data = FinancialData(**raw)
+
+
+    # Fill missing years
     for row in data.rows:
+
         for y in data.years:
+
             if y not in row.values:
                 row.values[y] = "MISSING"
+
+
     return data

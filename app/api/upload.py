@@ -2,7 +2,6 @@ from fastapi import APIRouter, UploadFile, File
 import uuid
 import os
 import re
-import datetime
 
 from app.core.config import UPLOAD_DIR, OUTPUT_DIR
 from app.core.logger import logger
@@ -20,7 +19,42 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-CURRENT_YEAR = datetime.datetime.now().year
+# ---------------- FILTER CONFIG ----------------
+
+CORE_KEYWORDS = [
+    "revenue",
+    "income",
+    "expense",
+    "cost",
+    "depreciation",
+    "amortisation",
+    "finance",
+    "interest",
+    "ebitda",
+    "profit",
+    "tax",
+    "eps",
+    "earning",
+    "margin"
+]
+
+
+CASHFLOW_WORDS = [
+    "repayment",
+    "lease liability",
+    "cash equivalent",
+    "interest paid",
+    "dividend paid",
+    "net cash",
+    "operating activities",
+    "investing activities",
+    "financing activities"
+]
+
+
+JUNK_WORDS = [
+    "gate", "sofa", "pna", "sss", "atom", "reofsiutian"
+]
 
 
 # ---------------- HELPERS ----------------
@@ -29,31 +63,18 @@ def is_valid_year(y: str) -> bool:
 
     y = y.strip()
 
-    if y.isdigit():
-        return 2000 <= int(y) <= CURRENT_YEAR
+    # 2024
+    if re.match(r"^20\d{2}$", y):
+        return True
 
-    if "/" in y:
-        try:
-            return int(y.split("/")[-1]) <= CURRENT_YEAR
-        except:
-            return False
+    # 31/12/2025
+    if re.match(r"^\d{2}/\d{2}/20\d{2}$", y):
+        return True
 
     return False
 
 
-def remove_empty_rows(rows, years):
-
-    clean = []
-
-    for r in rows:
-
-        if any(r["values"].get(y) != "MISSING" for y in years):
-            clean.append(r)
-
-    return clean
-
-
-def sort_key(y):
+def sort_year(y):
 
     if y.isdigit():
         return int(y)
@@ -62,6 +83,94 @@ def sort_key(y):
         return int(y.split("/")[-1])
 
     return 0
+
+
+def is_useful_row(name: str) -> bool:
+
+    if not name:
+        return False
+
+
+    n = name.lower().strip()
+
+
+    # Too short = OCR junk
+    if len(n) < 5:
+        return False
+
+
+    # ---------- Must contain core keyword ----------
+
+    CORE = [
+        "revenue",
+        "income",
+        "expense",
+        "cost",
+        "depreciation",
+        "amortisation",
+        "finance",
+        "interest",
+        "ebitda",
+        "profit",
+        "tax",
+        "earning",
+        "eps",
+        "margin"
+    ]
+
+    if not any(k in n for k in CORE):
+        return False
+
+
+    # ---------- Remove footnotes / adjustments ----------
+
+    BLOCK = [
+        "allowance",
+        "gain on",
+        "loss on",
+        "merger",
+        "disposal",
+        "exceptional",
+        "adjustment",
+        "share of",
+        "non controlling",
+        "minority",
+        "segment",
+        "reclassified",
+        "write down",
+        "impairment",
+        "provision",
+        "fair value",
+        "derivative",
+        "lease charge",
+        "one time",
+        "extraordinary"
+    ]
+
+    if any(b in n for b in BLOCK):
+        return False
+
+
+    # ---------- Remove balance-sheet items ----------
+
+    BALANCE_SHEET = [
+        "asset",
+        "liability",
+        "equity",
+        "borrowings",
+        "receivable",
+        "payable",
+        "inventory",
+        "capital",
+        "goodwill"
+    ]
+
+    if any(b in n for b in BALANCE_SHEET):
+        return False
+
+
+    return True
+
 
 
 # ---------------- API ----------------
@@ -75,13 +184,15 @@ async def upload(file: UploadFile = File(...)):
 
     pdf_path = f"{UPLOAD_DIR}/{file_id}.pdf"
 
+    logger.info(f"Saving file: {file.filename}")
+
     with open(pdf_path, "wb") as f:
         f.write(await file.read())
 
     logger.info("File saved")
 
 
-    # ---------- Extract Text ----------
+    # ---------- Try Table Extraction ----------
 
     tables = extract_tables(pdf_path)
 
@@ -90,15 +201,18 @@ async def upload(file: UploadFile = File(...)):
 
     if tables:
 
-        logger.info("Using Camelot tables")
+        logger.info("Using Camelot extracted tables")
 
         for df in tables:
             text += df.to_csv(index=False)
             text += "\n\n"
 
+
+    # ---------- OCR / Native Fallback ----------
+
     else:
 
-        logger.info("Using OCR/Text")
+        logger.info("No tables found. Using OCR/Text extraction")
 
         chunks = extract_text(pdf_path)
 
@@ -108,13 +222,18 @@ async def upload(file: UploadFile = File(...)):
 
     if not text.strip():
 
+        logger.error("No usable text extracted")
+
         return {
             "status": "error",
-            "message": "No readable content"
+            "message": "Could not extract content from PDF"
         }
 
 
-    # ---------- Chunk ----------
+    logger.info(f"Total extracted text length: {len(text)}")
+
+
+    # ---------- Chunk for LLM ----------
 
     MAX_CHUNK = 3500
 
@@ -123,8 +242,10 @@ async def upload(file: UploadFile = File(...)):
         for i in range(0, len(text), MAX_CHUNK)
     ]
 
+    logger.info(f"Split into {len(chunks)} LLM chunks")
 
-    # ---------- Aggregate ----------
+
+    # ---------- Aggregate Results ----------
 
     row_map = {}
     all_years = set()
@@ -138,8 +259,7 @@ async def upload(file: UploadFile = File(...)):
         if len(chunk.strip()) < 200:
             continue
 
-
-        logger.info(f"LLM chunk {i+1}/{len(chunks)}")
+        logger.info(f"Processing LLM chunk {i+1}/{len(chunks)}")
 
         result = parse_with_llm(chunk)
 
@@ -147,11 +267,14 @@ async def upload(file: UploadFile = File(...)):
             continue
 
 
+        # -------- Metadata --------
+
         currency = result.get("currency", currency)
         unit = result.get("unit", unit)
 
 
-        # Years
+        # -------- Years --------
+
         for y in result.get("years", []):
 
             y = str(y).strip()
@@ -160,7 +283,8 @@ async def upload(file: UploadFile = File(...)):
                 all_years.add(y)
 
 
-        # Rows
+        # -------- Rows --------
+
         for r in result.get("rows", []):
 
             name = r.get("name", "").strip()
@@ -169,7 +293,20 @@ async def upload(file: UploadFile = File(...)):
                 continue
 
 
-            key = name.lower()
+            lname = name.lower()
+
+
+            # Remove cashflow rows
+            if any(w in lname for w in CASHFLOW_WORDS):
+                continue
+
+
+            # Keep only income-statement rows
+            if not is_useful_row(name):
+                continue
+
+
+            key = lname
 
 
             if key not in row_map:
@@ -185,18 +322,19 @@ async def upload(file: UploadFile = File(...)):
                 year = str(year).strip()
 
                 if is_valid_year(year):
+
                     row_map[key]["values"][year] = val
 
 
-    # ---------- Keep Last 7 Years ----------
+    # ---------- Limit to Last 7 Years ----------
 
-    sorted_years = sorted(list(all_years), key=sort_key)
+    sorted_years = sorted(list(all_years), key=sort_year)
 
     if len(sorted_years) > 7:
         sorted_years = sorted_years[-7:]
 
 
-    logger.info(f"Final years: {sorted_years}")
+    logger.info(f"Final years used: {sorted_years}")
 
 
     # ---------- Filter Row Values ----------
@@ -211,12 +349,22 @@ async def upload(file: UploadFile = File(...)):
         row["values"] = filtered
 
 
+    all_years = set(sorted_years)
+
+
     # ---------- Remove Empty Rows ----------
 
-    rows = remove_empty_rows(
-        list(row_map.values()),
-        sorted_years
-    )
+    cleaned_rows = []
+
+    for row in row_map.values():
+
+        if any(v != "MISSING" for v in row["values"].values()):
+            cleaned_rows.append(row)
+
+
+    row_map = {
+        r["name"].lower(): r for r in cleaned_rows
+    }
 
 
     # ---------- Final Object ----------
@@ -224,17 +372,21 @@ async def upload(file: UploadFile = File(...)):
     raw = {
         "currency": currency,
         "unit": unit,
-        "years": sorted_years,
-        "rows": rows
+        "years": sorted(list(all_years), key=sort_year),
+        "rows": list(row_map.values())
     }
 
+
+    logger.info("Validating extracted data")
 
     data = validate_data(raw)
 
 
-    # ---------- Excel ----------
+    # ---------- Export Excel ----------
 
     excel_path = export_excel(data, file_id)
+
+    logger.info("Excel generated successfully")
 
 
     return {
